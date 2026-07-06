@@ -1,0 +1,175 @@
+TECHNICAL BRIEF: MULTI-AGENT LLM SYSTEM ARCHITECTURE (EXPANDED)
+
+Section 1: Overview of Multi-Agent Orchestration
+
+A multi-agent system decomposes a complex task into a set of specialized agents, each responsible for a narrow subtask, coordinated by an orchestrator. In LangGraph, this orchestration is expressed as a directed graph, where nodes represent agents or tools and edges represent control flow. State is passed between nodes as a shared, typed object, allowing each agent to read prior context and write its own contribution without overwriting unrelated fields. This design improves modularity: individual agents can be tested, replaced, or scaled independently of the rest of the pipeline.
+
+The graph abstraction also clarifies failure isolation. Because each node has a well-defined input and output contract, a fault in one agent does not necessarily propagate silently into the rest of the system — the orchestrator can detect that a node returned malformed output and route around it. This is a meaningful improvement over monolithic prompt chains, where a single oversized prompt tries to handle classification, retrieval, reasoning, and formatting all at once, making it nearly impossible to tell which part of the prompt caused a given failure.
+
+Orchestration graphs can be static (defined at design time, with a fixed set of nodes and edges) or dynamic (where the orchestrator decides at runtime which nodes to visit, sometimes looping back to earlier nodes for revision). Static graphs are easier to reason about, test, and audit, since every possible execution path can be enumerated in advance. Dynamic graphs are more flexible and can better handle open-ended tasks, but they require careful safeguards — such as maximum iteration counts and cycle detection — to avoid infinite loops or runaway costs.
+
+A further design consideration is granularity: how narrow should each agent's responsibility be? Extremely fine-grained decomposition (e.g., one agent per sentence-level operation) increases orchestration overhead and latency, while overly coarse decomposition reintroduces the debugging problems of a monolithic system. In practice, teams tend to converge on agent boundaries that align with natural subtask boundaries — retrieval, planning, generation, verification — rather than arbitrary splits.
+
+Section 2: The Router Agent Pattern
+
+A router agent inspects an incoming request and determines which downstream agent or tool chain should handle it. The router is typically implemented as a lightweight LLM call with a constrained output schema, such as a single classification label or a JSON object naming the next node. Constraining the output format reduces parsing errors and keeps the control flow deterministic. A well-designed router should fail safely: if the classification confidence is low, the system should default to a general-purpose agent rather than raising an exception.
+
+Routers can be implemented in several ways beyond a single LLM call. Rule-based routers use keyword matching or regular expressions and are appropriate when the space of possible requests is small and well understood; they are fast and fully deterministic, but brittle to novel phrasing. Embedding-based routers compute a vector representation of the incoming request and compare it against precomputed cluster centroids for each downstream agent, offering a middle ground between speed and flexibility. LLM-based routers, as described above, are the most flexible but introduce additional latency and cost, and their outputs must still be validated against the constrained schema before being trusted.
+
+A common failure mode in router design is what might be called "classification drift" — the router's behavior slowly changes as the underlying model is updated, even though the router's prompt has not changed. Because routers sit at the entry point of the entire pipeline, small shifts in classification behavior can cascade into large changes in downstream agent utilization. Teams that operate multi-agent systems in production typically maintain a held-out set of routing test cases with known-correct labels, and re-run this test set whenever the router's underlying model changes, to catch drift before it affects real users.
+
+Multi-label routing, where a single request may need to be handled by more than one downstream agent, adds further complexity. In these cases, the router's output schema must support returning a list of destinations rather than a single label, and the orchestrator must define how those destinations are sequenced or parallelized.
+
+Section 3: State Management Across Agent Boundaries
+
+Shared state in a multi-agent pipeline should be represented as an explicit schema rather than a loosely typed dictionary. Each field in the schema should have a single agent responsible for writing it, even if multiple agents read it. This avoids race conditions and makes debugging tractable, since a failure can always be traced to the agent that owns the relevant field. When state must be merged from parallel branches, an explicit reducer function should define how conflicting updates are resolved.
+
+Schema design for shared state typically distinguishes between three categories of fields: input fields (set once at the start of the pipeline and treated as immutable thereafter), working fields (mutated by exactly one designated agent as the pipeline progresses), and accumulator fields (appended to by multiple agents, such as a running log of tool calls or intermediate reasoning steps). Treating these three categories differently in the schema — for example, by making input fields read-only after initialization — prevents an entire class of bugs where a downstream agent accidentally overwrites data it was only supposed to read.
+
+State size is also a practical concern. As a pipeline executes, the shared state object tends to grow, since each agent's output is typically appended rather than replacing prior content. If left unchecked, this growth can push the effective context passed to later agents past the model's context window, or simply increase cost and latency for no benefit. A common mitigation is to define an explicit pruning or summarization step that runs periodically, collapsing verbose intermediate outputs (such as full tool call logs) into a compact summary before they are passed to agents that do not need the full detail.
+
+Versioned state is another pattern worth calling out: rather than mutating the state object in place, some implementations produce a new immutable state object at each step, with the prior version retained. This trades additional memory for the ability to replay a pipeline execution from any intermediate point, which is valuable for debugging and for human-in-the-loop review.
+
+Section 4: Tool-Calling Agents
+
+A tool-calling agent extends a base LLM with the ability to invoke external functions, such as database queries, API calls, or document retrieval. The agent framework intercepts the model's structured tool-call output, executes the corresponding function, and feeds the result back into the model's context before generating a final response. Robust tool-calling systems validate arguments before execution, enforce timeouts on external calls, and log every invocation for auditability.
+
+Argument validation deserves particular attention because it is the primary defense against a model hallucinating plausible-looking but invalid tool inputs. Validation should occur at multiple levels: type checking (does the argument match the expected type), range checking (is a numeric argument within an acceptable range), and semantic checking (does a referenced identifier, such as a customer ID, actually exist in the underlying system). A tool call that fails validation should be returned to the model as an error message rather than silently dropped, so that the model has the opportunity to self-correct on a subsequent turn.
+
+Timeout and retry policy also matters more than it might initially seem. External tools — particularly third-party APIs — can experience transient failures, and a naive implementation that immediately surfaces any failure to the end user will produce a much less reliable system than one that retries with exponential backoff for a bounded number of attempts. At the same time, retries must be bounded, both to control latency and to avoid amplifying load on an already-struggling downstream service.
+
+A related but distinct concern is tool selection when many tools are available. As the number of registered tools grows into the dozens or hundreds, simply listing all of them in the model's context becomes expensive and can degrade the model's ability to choose correctly. A common mitigation is to add a tool-retrieval step: given the incoming request, retrieve only the small subset of tools that are plausibly relevant, and expose only those to the model for that turn.
+
+## Section 5: Human-in-the-Loop Gates
+
+Certain decisions, particularly those with legal, ethical, or safety implications, should not be fully automated. A human-in-the-loop gate is a node in the pipeline that pauses execution and waits for explicit approval from a human reviewer before the pipeline can proceed. This pattern is essential in domains such as hiring, healthcare, and finance, where an automated recommendation must not become a final decision without human sign-off. The gate should be enforced at the data layer, not merely at the interface layer, so that no code path can bypass it.
+
+Enforcing the gate at the data layer typically means that the record representing a pending decision carries an explicit status field (such as "pending_review," "approved," or "rejected") and that any downstream system consuming that record — a notification service, a billing system, a document generator — checks the status field before acting. If the gate were instead enforced only in the user interface (for example, by simply not showing a "finalize" button until review is complete), a bug, a direct API call, or a batch job could bypass the intended control entirely.
+
+Designing the reviewer's experience is itself a nontrivial part of building an effective human-in-the-loop gate. Presenting the reviewer with the model's full chain of reasoning, the specific evidence it relied on, and a clear summary of what is being requested tends to produce better review decisions than presenting only the model's final recommendation. Some systems also track reviewer override rates as a quality signal: if a particular agent's recommendations are frequently overridden by human reviewers, that is a strong indicator that the agent's prompt or underlying model needs attention.
+
+Latency introduced by human review is a real operational cost, and systems that rely heavily on human-in-the-loop gates need a strategy for managing reviewer queues — for example, prioritizing time-sensitive decisions, load-balancing across multiple reviewers, and escalating requests that have waited beyond a defined service-level threshold.
+
+Section 6: Retrieval-Augmented Generation in Multi-Agent Pipelines
+
+Retrieval-augmented generation, or RAG, grounds an agent's output in an external knowledge base rather than relying solely on the model's parametric memory. A retriever agent embeds the incoming query, searches a vector index such as FAISS for the most relevant document chunks, and passes those chunks into the generation agent's context window. This reduces hallucination and allows the system to cite specific sources. Chunking strategy matters: chunks that are too small lose context, while chunks that are too large dilute retrieval precision.
+
+Beyond basic chunk size, chunking strategy also involves decisions about overlap between adjacent chunks (to avoid losing information that spans a chunk boundary), and about whether chunks should respect document structure such as section headings and paragraph boundaries rather than being split at a fixed token count. Structure-aware chunking tends to produce more coherent retrieved passages, at the cost of somewhat more complex preprocessing.
+
+Retrieval quality can also be improved through techniques beyond a single dense-vector search. Hybrid retrieval combines dense embedding search with sparse keyword search (such as BM25), which helps in cases where the exact terminology in the query matters — for example, a product code or a proper noun that a dense embedding model might not represent precisely. Re-ranking is another common addition: after an initial retrieval step returns a larger candidate set, a separate, more expensive re-ranking model scores each candidate against the query and reorders them, so that only the highest-quality passages are ultimately passed into the generation agent's context.
+
+Multi-agent RAG pipelines sometimes include a dedicated "sufficiency" check between retrieval and generation: an agent that examines the retrieved passages and determines whether they actually contain enough information to answer the query, rather than assuming retrieval always succeeds. If the check fails, the pipeline can trigger a query reformulation step, a broader search, or an explicit "insufficient information" response rather than allowing the generation agent to fabricate an answer from inadequate context.
+
+Section 7: Audit Logging and Observability
+
+Every agent invocation in a production multi-agent system should emit a structured log entry containing the input, output, latency, and any tool calls made. This audit trail supports debugging, compliance reporting, and bias auditing. Observability should extend beyond simple logging to include tracing across the full graph execution, so that a slow or failing request can be attributed to a specific node rather than the pipeline as a whole.
+
+Distributed tracing, borrowed from conventional microservice architectures, is particularly well suited to multi-agent pipelines because each agent invocation can be represented as a span within a larger trace, with parent-child relationships mirroring the graph's edges. This makes it possible to visualize an entire pipeline execution as a timeline, immediately showing which node consumed the most time or where a retry occurred.
+
+Structured logs should also capture metadata that is easy to overlook in early implementations: the exact model version used for each call, the prompt template version, the token counts for input and output, and any feature flags active at the time of the request. Without this metadata, it becomes very difficult to answer questions like "did output quality change after last week's prompt update" during a post-incident review.
+
+Observability data has a secondary use beyond debugging: it forms the raw material for the regression testing and bias auditing processes described elsewhere in this brief. A system that logs thoroughly from the start makes it much cheaper to build these downstream capabilities later, whereas retrofitting logging onto an already-deployed pipeline is comparatively costly.
+
+Section 8: Error Handling and Fallback Chains
+
+Agents should never fail silently. A well-architected pipeline defines a fallback chain: if a specialized agent raises an exception or returns a low-confidence result, control passes to a simpler, more conservative agent rather than terminating the request. Retries should be bounded and use exponential backoff for external API calls. Fallback behavior should be observable in logs so that degraded performance is visible to the engineering team.
+
+Designing a good fallback chain requires thinking about what "conservative" means for a given domain. In a customer support pipeline, a conservative fallback might be an agent that simply acknowledges the request and offers to connect the user with a human agent, rather than attempting a full automated resolution. In a data-extraction pipeline, a conservative fallback might return partial results with explicit markers indicating which fields could not be extracted with confidence, rather than either failing entirely or guessing.
+
+It is also worth distinguishing between transient failures (a timeout calling an external API, a temporary rate limit) and structural failures (a malformed request that no retry will fix). Retrying a structural failure wastes latency and cost without any chance of success, so fallback logic should attempt to classify the failure type before deciding whether to retry, fall back, or fail fast.
+
+Fallback chains interact with cost in a way that is easy to overlook: if a primary agent using an expensive, high-capability model fails frequently and falls back to a secondary agent using a similarly expensive model, the pipeline may be paying for two expensive calls on a significant fraction of requests. Monitoring the fallback rate, and treating an elevated fallback rate as an incident worth investigating rather than a normal background occurrence, helps keep both cost and quality in check.
+
+Section 9: Prompt Engineering for Agent Roles
+
+Each agent in a pipeline should have a narrowly scoped system prompt that defines its role, its expected input format, and its expected output format. Overloading a single agent with multiple responsibilities tends to degrade output quality and makes prompt debugging difficult. Role-scoped prompts also make it easier to swap the underlying model for a given agent without affecting the rest of the pipeline, since the contract between agents is defined by the schema, not by the specific model.
+
+A useful discipline when writing a role-scoped prompt is to explicitly separate four elements: the agent's persona or role, the constraints it must respect, the format its output must take, and a small number of representative examples. Keeping these elements in distinct, clearly labeled sections of the prompt — rather than blending them into a single narrative paragraph — makes the prompt easier to maintain as the pipeline evolves, since a change to the output format, for instance, can be made without touching the constraints section.
+
+Prompt length is also a consideration distinct from prompt clarity. A longer, more thorough prompt is not automatically better; past a certain point, additional instructions can dilute the model's attention on the instructions that matter most for a given task. Teams often find it useful to periodically audit each agent's prompt and remove instructions that were added to handle an edge case that, in practice, rarely or never occurs in production traffic.
+
+Because role-scoped prompts define the contract between agents, changing one agent's prompt without a corresponding update to any agent that consumes its output is a common source of pipeline regressions. Treating prompts as versioned, tested artifacts — as discussed further in Section 12 — helps catch these regressions before they reach production.
+
+Section 10: Evaluation of Multi-Agent Systems
+
+Evaluating a multi-agent pipeline requires both component-level and end-to-end metrics. Component-level evaluation tests each agent in isolation against a labeled dataset, measuring precision on classification tasks or factual accuracy on generation tasks. End-to-end evaluation measures whether the full pipeline produces the correct final outcome, accounting for error propagation across agent boundaries. Regression tests should be run whenever a single agent's prompt or model is updated, since a change that improves one agent's output can degrade the input quality for a downstream agent.
+
+Component-level evaluation benefits from being run against a fixed, versioned test set rather than a set of examples that changes over time, since a changing test set makes it impossible to tell whether a metric change reflects a real improvement or simply a different (and possibly easier or harder) distribution of test cases. It is common to maintain separate test sets for common cases, edge cases, and adversarial cases, since an agent's performance can vary substantially across these categories even when its aggregate score looks acceptable.
+
+End-to-end evaluation is inherently more expensive to construct, since it requires ground-truth labels for the final pipeline output rather than for any single agent's intermediate output, and producing those labels often requires domain expert review. A practical middle ground used by many teams is "trace-level" evaluation: taking full execution traces from production (or from a held-out test set), and having a human — or a separate, more capable model acting as a judge — assess the quality of the final output along with the reasoning that led to it.
+
+Using a separate LLM as an evaluator ("LLM-as-judge") is increasingly common for tasks where human review does not scale, but it introduces its own failure modes: judge models can have systematic biases, such as preferring longer responses or being swayed by superficial formatting rather than substantive correctness. Calibrating an LLM judge against a smaller set of human-labeled examples, and periodically re-checking that calibration, helps keep automated evaluation trustworthy.
+
+## Section 11: Latency and Cost Optimization
+
+Multi-agent pipelines can incur significant latency and cost because each agent may issue its own LLM call. Optimization strategies include caching repeated sub-queries, routing simple requests to smaller models, and batching independent agent calls that do not depend on each other's output. Streaming partial results to the user during long-running pipelines improves perceived responsiveness even when total latency is unchanged.
+
+Caching deserves particular attention in multi-agent systems because the same sub-query — for example, a retrieval lookup or a classification decision — can recur frequently across different end-user requests. A well-designed cache key needs to capture everything that affects the output (the exact query, the model version, any relevant context) while remaining specific enough to avoid serving stale or incorrect results for a subtly different request. Cache invalidation policy, particularly for caches backed by an external knowledge base that changes over time, is one of the more error-prone aspects of this optimization.
+
+Model routing by task difficulty — sometimes called a "cascade" — is another effective cost lever: a cheap, fast model attempts the task first, and only if it reports low confidence, or its output fails a validation check, does the pipeline escalate to a more expensive model. This can substantially reduce average cost, since a large share of real-world requests tend to be straightforward, while preserving quality on the harder tail of requests that genuinely need a more capable model.
+
+Batching independent agent calls is most valuable in graphs with parallel branches — for instance, three independent retrieval calls that do not depend on each other's output can be issued concurrently rather than sequentially, reducing wall-clock latency without changing the total amount of computation performed. This requires the orchestration framework to correctly identify which nodes have no data dependency on each other, which is one of the reasons an explicit graph representation, rather than an implicit chain of function calls, is valuable.
+
+Section 12: Versioning and Reproducibility
+
+Every component of a multi-agent system, including prompts, model versions, and tool schemas, should be versioned. Reproducibility requires that a given input, combined with a given pipeline version, always produces a deterministic or bounded-variance output. This is particularly important for systems that support human review, since a reviewer must be able to trace a decision back to the exact configuration that produced it.
+
+In practice, versioning a multi-agent system means treating the entire pipeline configuration — not just the code, but the specific prompt text for each agent, the model identifier and any sampling parameters, the tool schemas, and the graph topology itself — as a single artifact that can be checked out, deployed, and rolled back as a unit. Storing prompts as plain-text files under version control, rather than embedding them as string literals scattered across application code, makes this considerably easier to manage and review.
+
+Because LLM outputs are not fully deterministic even at a fixed temperature and model version, "reproducibility" for these systems usually means bounded-variance reproducibility rather than bit-for-bit reproducibility: given the same input and pipeline version, the distribution of possible outputs should be consistent, and any single output should fall within an expected, previously-validated range of behavior. Some high-stakes deployments mitigate this further by setting temperature to zero for the specific agents whose outputs feed into consequential decisions, accepting some loss of output diversity in exchange for tighter reproducibility guarantees.
+
+Reproducibility also has a legal and compliance dimension in regulated industries: if a decision is later challenged, the organization operating the pipeline may need to demonstrate exactly what configuration produced that decision, which is only possible if versioning has been treated as a first-class requirement from the start rather than added retroactively.
+
+Section 13: Security Considerations for Tool-Calling Agents
+
+Tool-calling agents introduce an expanded attack surface, since a malicious or malformed input could attempt to manipulate the agent into calling a tool with unintended arguments. Input sanitization, strict argument schemas, and allow-listing of permitted tool calls are essential defenses. Agents that can write to a database or trigger external actions should require an additional confirmation step before executing irreversible operations.
+
+Prompt injection is a particularly relevant threat model for tool-calling agents: if any part of the agent's context includes untrusted content — text from a retrieved document, the body of an incoming email, content scraped from a web page — that content could contain instructions crafted to manipulate the agent into taking an action the legitimate user did not request. Effective mitigations include treating retrieved or externally sourced content as data rather than instructions wherever possible, and requiring that any tool call with real-world side effects be explicitly confirmed by the legitimate requester rather than triggered purely by content the agent read.
+
+Least-privilege design is another important principle: an individual agent should only have access to the specific tools it needs for its narrow responsibility, rather than a broad set of tools "just in case." This limits the potential damage if a given agent is successfully manipulated, and it also simplifies auditing, since the set of actions any given agent could plausibly have taken is smaller and easier to reason about.
+
+Logging tool calls in detail, as described in Section 7, doubles as a security control: a detailed, tamper-resistant log of every tool invocation, including the arguments used and the agent that issued the call, is often the only way to reconstruct what happened after a security incident, and its existence can itself act as a deterrent.
+
+Section 14: Designing for Bias Auditing
+
+A responsible multi-agent system that makes recommendations about people, such as candidate screening or credit evaluation, should include a dedicated bias-auditing component. This component analyzes outcomes across protected attributes and flags statistically significant disparities for human review. Bias auditing should run continuously in production, not only during initial model validation, since data drift can introduce new disparities over time.
+
+Effective bias auditing requires deciding, in advance, which outcome disparities the organization considers actionable, and at what threshold of statistical significance a flag should be raised for human review. Waiting until an ad hoc investigation to define these thresholds tends to produce inconsistent, after-the-fact judgments about whether an observed disparity is meaningful.
+
+Bias auditing in a multi-agent system also needs to account for where in the pipeline a disparity originates. A downstream disparity in final recommendations could originate in the routing step, in a retrieval step that surfaces different quality of supporting evidence for different groups, or in the final generation step itself — and distinguishing between these requires the kind of node-level observability discussed in Section 7. Auditing only the pipeline's final output, without visibility into intermediate agent behavior, makes it much harder to identify where a corrective fix should be applied.
+
+Because bias auditing depends on comparing outcomes across groups defined by protected attributes, the system must also handle the sensitive data governance question of how and where that attribute data is collected, stored, and used — typically requiring that it be used only by the auditing component itself, and not exposed to the agents making the underlying recommendations.
+
+Section 15: Deployment Patterns for Agent Graphs
+
+When deploying a LangGraph-based pipeline, each node can be scaled independently based on its resource profile: a lightweight classification node may run on CPU, while a generation node may require GPU acceleration. Health checks should verify not just process liveness but the ability of each agent to successfully complete a minimal end-to-end request. Blue-green deployment of pipeline updates allows a new graph version to be validated against production traffic before fully replacing the previous version.
+
+Canary deployment is a related pattern worth calling out separately from blue-green deployment: rather than switching all traffic to the new pipeline version at once, a small percentage of production requests is routed to the new version while the majority continues to use the previous, known-good version. Key metrics — error rate, latency, and where possible, output quality — are compared between the two populations before gradually increasing the canary's traffic share.
+
+Independent scaling of nodes also has implications for how the orchestrator itself is deployed. If the orchestrator is a single centralized service, it can become a bottleneck or single point of failure as traffic grows, which argues for designing the orchestration layer itself to be horizontally scalable and stateless, with all pipeline state persisted externally rather than held in the orchestrator's own memory.
+
+Rollback strategy deserves explicit planning rather than being an afterthought: because pipeline behavior depends on prompts, model versions, and graph topology together, a rollback needs to revert all of these components as a coherent unit, which is another practical benefit of the versioning discipline described in Section 12.
+
+Section 16: Memory Systems for Long-Running Agents
+
+Beyond the per-request shared state described in Section 3, some multi-agent systems maintain longer-lived memory that persists across multiple separate interactions with the same user or entity. This might include a summary of prior conversations, learned user preferences, or a record of past decisions relevant to future ones. Designing this memory layer requires deciding what should be remembered indefinitely, what should decay or be summarized over time, and what should never be retained at all for privacy reasons.
+
+A common architecture separates memory into short-term (the current session's shared state), episodic (a log of past sessions or interactions), and semantic (distilled facts or preferences extracted from those past interactions). Semantic memory is typically the most valuable for personalization but also the most error-prone to construct, since it requires an extraction step that itself can introduce inaccuracies if not carefully validated.
+
+Memory retrieval at the start of a new session functions much like the retrieval-augmented generation pattern described in Section 6, and benefits from the same considerations around chunking, relevance ranking, and sufficiency checking, applied to a user's own history rather than a general knowledge base.
+
+Section 17: Multi-Modal Agents
+
+Some multi-agent pipelines must handle inputs or outputs beyond text, such as images, audio, or structured tabular data. A multi-modal agent typically wraps a model capable of processing the relevant modality directly, or delegates to a specialized preprocessing step — such as optical character recognition for scanned documents, or transcription for audio — before passing the result into the rest of the text-based pipeline.
+
+Combining modalities within a single pipeline introduces additional schema design questions: the shared state object needs a way to represent non-text content, typically as a reference to externally stored binary data rather than embedding the raw bytes directly in the state, to keep the state object itself lightweight and serializable.
+
+Section 18: Testing Strategies Beyond Evaluation Metrics
+
+In addition to the accuracy-focused evaluation described in Section 10, multi-agent systems benefit from more traditional software testing practices adapted to their probabilistic nature. Unit tests for individual agents can assert on structural properties of the output — does it conform to the expected schema, does it stay within expected length bounds — even when the exact content cannot be asserted deterministically. Integration tests can exercise the full graph with mocked tool responses, verifying that control flow behaves correctly under both success and failure conditions for each tool call.
+
+Chaos-style testing, familiar from distributed systems engineering, is also applicable: deliberately injecting failures — a timeout on a specific tool call, a malformed response from one agent — and verifying that the fallback chains described in Section 8 behave as intended, rather than assuming they will work correctly simply because they were implemented.
+
+Section 19: Summary of Best Practices
+
+In summary, a well-engineered multi-agent LLM system separates concerns across narrowly scoped agents, defines explicit and typed shared state, enforces human review at points of consequential decision-making, logs every invocation for observability, and treats prompts, models, and schemas as versioned artifacts. These practices transform a multi-agent pipeline from a fragile prototype into a maintainable, auditable production system. Taken together with disciplined evaluation, cost-aware routing, deliberate memory design, and security controls scoped to the principle of least privilege, these practices form the foundation of a multi-agent architecture that can be operated reliably at production scale rather than remaining a promising but brittle demonstration.
